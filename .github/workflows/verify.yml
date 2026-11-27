@@ -1,0 +1,79 @@
+name: Verify DataDuck
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - '**'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_benchmark:
+        description: Run the full Windows workload matrix
+        type: boolean
+        default: false
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - run: cargo build --locked --release
+      - name: Smoke-test the release executable
+        run: python scripts/benchmark.py --exe target/release/dataduck${{ runner.os == 'Windows' && '.exe' || '' }} --small --output smoke.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-${{ runner.os }}
+          path: smoke.json
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: dataduck-windows-x64
+          path: target/release/dataduck.exe
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dataduck-windows-x64
+          path: dist
+      - name: Publish Windows executable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          sha256sum dataduck.exe > dataduck.exe.sha256
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dataduck.exe dataduck.exe.sha256 --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dataduck.exe dataduck.exe.sha256 --verify-tag --generate-notes --title "DataDuck ${GITHUB_REF_NAME}"
+          fi
+  full-benchmark:
+    if: github.event_name == 'workflow_dispatch' && inputs.full_benchmark
+    runs-on: windows-latest
+    timeout-minutes: 360
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dataduck-windows-x64
+          path: bin
+      - name: Benchmark native Windows
+        run: python scripts/benchmark.py --exe bin/dataduck.exe --output benchmark.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-benchmark
+          path: benchmark.json

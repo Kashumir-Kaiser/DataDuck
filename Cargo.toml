@@ -1,0 +1,32 @@
+[package]
+name = "dataduck"
+version = "0.1.0"
+edition = "2021"
+description = "Memory-bounded local spreadsheet profiling and offline HTML dashboards"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+ctrlc = "3"
+encoding_rs = "0.8"
+fs2 = "0.4"
+globset = "0.4"
+num-bigint = "0.4"
+quick-xml = "0.37"
+same-file = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+toml = "0.8"
+walkdir = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_Storage_FileSystem", "Win32_Security"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

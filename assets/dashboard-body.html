@@ -1,0 +1,24 @@
+</style>
+</head>
+<body>
+<header><div class="brand">DataDuck</div><div class="brand-sub">Dataset profile</div></header>
+<main>
+<section aria-labelledby="overview-heading">
+<div class="section-title"><h1 id="overview-heading">Dataset overview</h1><span class="local">Offline report</span></div>
+<div class="metrics" id="metrics"></div>
+<p id="partial" class="notice" hidden></p>
+</section>
+<nav aria-label="Report views"><button id="view-profile" aria-pressed="true">Table profiles</button><button id="view-sources" aria-pressed="false">Source audit</button></nav>
+<section id="profile-view" aria-labelledby="view-profile">
+<div class="table-bar"><label for="tables">Table</label><select id="tables"></select><span class="quiet" id="table-summary"></span></div>
+<div id="profile-body">
+<div class="column-layout">
+<aside><h2>Columns</h2><label class="search-label" for="column-search">Find a column</label><input id="column-search" type="search" placeholder="Search names"><div id="columns" class="column-list" aria-label="Columns"></div><div id="column-pages"></div></aside>
+<article id="detail" aria-label="Column profile"></article>
+</div>
+<section class="panel sample-panel" aria-labelledby="sample-heading"><div class="section-title"><h2 id="sample-heading">Row sample</h2><span class="quiet" id="sample-count"></span></div><div id="sample"></div></section>
+</div></section>
+<section id="source-view" aria-labelledby="view-sources" hidden><div class="panel"><h2>Source audit</h2><div id="sources"></div></div></section>
+</main>
+<noscript>Enable JavaScript to explore the embedded profile.</noscript>
+<script type="application/json" id="report-data">
