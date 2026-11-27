@@ -40,8 +40,8 @@ aside input{width:100%;}
 .detail-head h2,td,dd,.quiet{overflow-wrap:anywhere}
 dl{display:flex;flex-wrap:wrap;gap:.55rem 1.9rem;margin:1rem 0;padding:1rem 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
 dt{color:var(--muted);font-size:.8rem}dd{margin:0;font-weight:600;font-variant-numeric:tabular-nums}
-.chart{height:205px;max-width:100%;overflow:hidden}.chart-tools{display:flex;align-items:center;flex-wrap:wrap;gap:.6rem;margin:.45rem 0}
-.chart-readout{font-variant-numeric:tabular-nums;font-size:.85rem;color:var(--muted)}
+.chart{max-width:100%;overflow:hidden}.chart-tools{display:flex;align-items:center;flex-wrap:wrap;gap:.6rem;margin:.45rem 0}
+.chart-readout{min-width:0;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;font-size:.85rem;color:var(--muted)}
 .table-wrap{overflow:auto;max-width:100%;margin:.6rem 0}
 table{border-collapse:collapse;min-width:100%;font-size:.86rem}
 td,th{padding:.48rem .6rem;border-bottom:1px solid #d9e3df;text-align:left;vertical-align:top}th{color:var(--muted);background:#f4f7f4;font-weight:600}

@@ -100,33 +100,62 @@
         observer = null;
         plot = null;
     }
-    function drawBins(parent, bins, title) {
-        parent.append(el("h3", title));
+    function bucketTicks(bins, numeric) {
+        const labels = bins.map(bucket => bucket.label);
+        if (!numeric) return {labels};
+
+        // Numeric ranges are stored as exact "[start, end)" strings. Only the
+        // axis needs a short approximation. Keep the original range elsewhere.
+        const starts = labels.map(range => range.startsWith("[")
+            ? range.slice(1, range.indexOf(",")) : range);
+        const values = starts.map(Number);
+        if (values.every((n, i) => Number.isFinite(n) && (n !== 0 || starts[i] === "0"))) {
+            for (let digits = 3; digits <= 8; digits++) {
+                const options = {useGrouping: false, maximumSignificantDigits: digits};
+                const plain = new Intl.NumberFormat(document.documentElement.lang, options);
+                const scientific = new Intl.NumberFormat(document.documentElement.lang, {...options, notation: "scientific"});
+                const ticks = values.map(n => (Math.abs(n) >= 1e7 || (n !== 0 && Math.abs(n) < 0.001)
+                    ? scientific : plain).format(n));
+                if (new Set(ticks).size === values.length) {
+                    return {labels: ticks, caption: bins.length > 1 ? "Bucket start (rounded)" : "Value (rounded)"};
+                }
+            }
+        }
+        // Very close or very large exact decimals may share a browser number.
+        return {labels: labels.map((_, i) => number(i + 1)), caption: "Bucket number"};
+    }
+    function drawBins(parent, bins, numeric) {
+        parent.append(el("h3", numeric ? "Distribution" : "Date distribution"));
         const host = el("div", undefined, "chart");
         host.setAttribute("aria-hidden", "true");
         const tools = el("div", undefined, "chart-tools");
-        const readout = el("span", "Drag to zoom. Hover for a bucket count.", "chart-readout");
+        const hint = "Drag to zoom. Hover for the exact bucket and count.";
+        const readout = el("span", hint, "chart-readout");
         const reset = btn("Reset zoom", () => plot && plot.setScale("x", {min: -0.5, max: bins.length - 0.5}));
         tools.append(reset, readout);
         parent.append(host, tools);
         const color = "#09796c";
         const x = bins.map((_, i) => i);
         const count = bins.map(item => Number(item.count));
-        const short = i => {
-            const s = String(bins[i]?.label ?? "");
-            return s.length > 18 ? s.slice(0, 17) + "…" : s;
-        };
+        const {labels, caption} = bucketTicks(bins, numeric);
+        const font = "12px system-ui, sans-serif";
+        const measure = document.createElement("canvas").getContext("2d");
+        measure.font = font;
+        const labelWidth = Math.ceil(Math.max(...labels.map(text => measure.measureText(text).width)));
+        const height = caption ? 225 : 200;
         function updateCursor(self) {
             const bucket = bins[self.cursor.idx];
-            readout.textContent = bucket ? label(bucket.label) + " · " + number(bucket.count) : "Drag to zoom. Hover for a bucket count.";
+            readout.textContent = bucket ? bucket.label + " · " + number(bucket.count) : hint;
         }
         plot = new uPlot({
-            width: Math.max(1, host.clientWidth), height: 200,
+            width: Math.max(1, host.clientWidth), height,
+            padding: [null, Math.ceil(labelWidth / 2) + 4, null, null],
             legend: {show: false}, cursor: {drag: {x: true, y: false}},
             scales: { x: {time: false, range: (_, min, max) => [min === 0 ? -0.5 : min, max === bins.length - 1 ? max + 0.5 : max]}, y: {auto: true, range: (_, min, max) => [0, Math.max(1, max) * 1.08]} },
             series: [{}, {label: "Count", stroke: color, fill: color, paths: uPlot.paths.bars({size:[0.84, 72]}), points:{show:false}}],
             axes: [
-                {size:42, space:72, values: (_, ticks) => ticks.map(i => Number.isInteger(i) ? short(i) : "")},
+                {font, size: 36, space: labelWidth + 12, label: caption, labelSize: 24,
+                    values: (_, ticks) => ticks.map(i => labels[i] ?? "")},
                 {size:68, values: (_, ticks) => ticks.map(n => number(n))}
             ],
             hooks: {setCursor: [updateCursor]}
@@ -136,13 +165,13 @@
             observer = new ResizeObserver(() => {
                 if (plot && host.clientWidth && host.clientWidth !== lastWidth) {
                     lastWidth = host.clientWidth;
-                    plot.setSize({width:lastWidth, height:200});
+                    plot.setSize({width:lastWidth, height});
                 }
             });
             observer.observe(host);
         }
         const details = el("details");
-        details.append(el("summary", "Bucket counts"), grid(["Bucket", "Count"], bins.map(b => [b.label, number(b.count)])));
+        details.append(el("summary", "Bucket counts"), grid(["Bucket", "Count"], bins.map(b => [el("span", b.label), number(b.count)])));
         parent.append(details);
     }
     const active = () => report.tables[tableIndex];
@@ -164,7 +193,7 @@
         parent.append(properties(pairs));
         const missing = Object.entries(c.missing_reasons || {});
         if (missing.length) parent.append(el("h3", "Missing values"), grid(["Reason", "Count"], missing.map(([key,n]) => [key, number(n)])));
-        if (c.bins?.length) drawBins(parent, c.bins, ["date","datetime"].includes(c.kind) ? "Date distribution" : "Distribution");
+        if (c.bins?.length) drawBins(parent, c.bins, c.kind === "integer" || c.kind === "decimal");
         if (c.top?.length) {
             parent.append(el("h3", "Most frequent values"));
             const rows = c.top.map(item => [item.value, number(item.count)]);
