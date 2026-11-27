@@ -56,7 +56,6 @@ struct Session {
     child: Process,
     input: File,
     output: File,
-    cursor: usize,
 }
 
 impl Session {
@@ -75,7 +74,6 @@ impl Session {
             child: Process(child),
             input,
             output,
-            cursor: 0,
         })
     }
 
@@ -118,7 +116,7 @@ impl Session {
         Ok(())
     }
 
-    fn screen(&self) -> io::Result<Vec<u16>> {
+    fn screen(&self) -> io::Result<(String, String)> {
         // Capture the text cells through the current cursor line for progress checks.
         // Unlike the helper's redirected stderr, this buffer contains the real prompt.
         unsafe {
@@ -141,27 +139,31 @@ impl Session {
                 return Err(io::Error::last_os_error());
             }
             text.truncate(read as usize);
-            Ok(text)
+            let row = info.dwCursorPosition.Y as usize * info.dwSize.X as usize;
+            let current_line = String::from_utf16_lossy(text.get(row..).unwrap_or_default());
+            Ok((String::from_utf16_lossy(&text), current_line))
         }
     }
 
     fn expect(&mut self, text: &str) {
-        let marker: Vec<_> = text.encode_utf16().collect();
         let until = Instant::now() + TIMEOUT;
         loop {
-            let screen = self.screen().unwrap();
-            if let Some(found) = screen.get(self.cursor..).and_then(|rest| {
-                rest.windows(marker.len())
-                    .position(|window| window == marker)
-            }) {
-                self.cursor += found + marker.len();
+            // Earlier lines can scroll out of the buffer as each command prints.
+            // A blank command line confirms the prompt has returned after its output.
+            let (screen, current_line) = self.screen().unwrap();
+            let visible = if text == PROMPT {
+                current_line.trim_end() == PROMPT
+            } else {
+                screen.contains(text)
+            };
+            if visible {
                 return;
             }
             let status = self.child.0.try_wait().unwrap();
             assert!(
                 status.is_none() && Instant::now() < until,
                 "Console did not show {text:?} (exit {status:?})\n{}",
-                String::from_utf16_lossy(&screen).trim_end(),
+                screen.trim_end(),
             );
             std::thread::sleep(Duration::from_millis(25));
         }
