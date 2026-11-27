@@ -4,7 +4,16 @@ Turn local Excel workbooks and delimited files into a single interactive HTML da
 
 ## Run on Windows
 
-Download `dataduck.exe` from [GitHub Releases](https://github.com/Kashumir-Kaiser/DataDuck/releases), place it in a working directory, and open PowerShell there. A downloaded Google Sheets workbook can be used directly as an XLSX. CSV and TSV exports represent individual sheets.
+Download `dataduck.exe` from [GitHub Releases](https://github.com/Kashumir-Kaiser/DataDuck/releases) and place it in your project folder. Double-click it to open the DataDuck prompt in that folder. The prompt already displays `.\DataDuck `, so type only the command and its arguments. Wrap paths containing spaces in double quotes.
+
+```text
+.\DataDuck build "Sales data.xlsx" -o "Sales report.html"
+.\DataDuck inspect "Sales data.xlsx" --sheet "Monthly sales" --rows 20
+```
+
+Type `help` to see the commands or `exit` to close the prompt. You can run several commands in the same session.
+
+You can also run the executable directly from a terminal. Commands with arguments use your current working directory. A downloaded Google Sheets workbook can be used directly as an XLSX. CSV and TSV exports represent individual sheets.
 
 ```powershell
 .\dataduck.exe build .\sales.xlsx -o .\sales.html
@@ -58,7 +67,7 @@ For two header rows, use `header_rows = [4, 5]`. For a headerless source, use `h
 
 ## Resource limits and outcomes
 
-The Windows process installs a **1,000,000,000-byte committed-memory limit** before ingestion. DataDuck streams sparse rows and stores shared strings, committed segments, and sorted frequency runs on disk. The browser has its own memory use. The CLI prints peak scratch and process memory statistics at the end of a successful build.
+The Windows process installs a **1,000,000,000-byte committed-memory limit** before ingestion. DataDuck streams sparse rows and stores shared strings, committed segments, and sorted frequency runs on disk. The browser has its own memory use. The CLI prints peak scratch and process memory statistics at the end of a successful build. In the DataDuck prompt, each command releases its data buffers and scratch files when it finishes. The reported peak process memory covers the session so far.
 
 Scratch defaults to the system temporary directory with a 24 GiB quota and a 2 GiB free-space reserve. A compressed workbook can need several times its physical size. Use an SSD with enough room.
 

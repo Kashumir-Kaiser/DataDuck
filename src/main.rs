@@ -4,6 +4,8 @@ mod layout;
 mod manifest;
 mod model;
 mod profile;
+#[cfg(windows)]
+mod prompt;
 mod report;
 mod resource;
 mod segment;
@@ -1022,25 +1024,22 @@ fn publish(
     }
     res
 }
-fn main() -> std::process::ExitCode {
-    let cli = Cli::try_parse().unwrap_or_else(|e| {
-        let code = if e.use_stderr() { 64 } else { 0 };
-        let _ = e.print();
-        std::process::exit(code)
-    });
-    let result = (|| -> Result<bool> {
-        let guard = resource::MemoryGuard::install()?;
-        ctrlc::set_handler(|| {
-            resource::CANCELLED.store(true, std::sync::atomic::Ordering::Relaxed)
-        })?;
-        match cli.command {
-            Command::Build(o) => build(o, &guard),
-            Command::Inspect(o) => {
-                inspect(o)?;
-                Ok(false)
-            }
+fn install_cancel_handler() -> Result<()> {
+    ctrlc::set_handler(|| resource::CANCELLED.store(true, std::sync::atomic::Ordering::Relaxed))?;
+    Ok(())
+}
+
+fn run_command(cli: Cli, guard: &resource::MemoryGuard) -> Result<bool> {
+    match cli.command {
+        Command::Build(o) => build(o, guard),
+        Command::Inspect(o) => {
+            inspect(o)?;
+            Ok(false)
         }
-    })();
+    }
+}
+
+fn command_exit_code(result: Result<bool>) -> std::process::ExitCode {
     match result {
         Ok(false) => 0.into(),
         Ok(true) => 2.into(),
@@ -1053,4 +1052,21 @@ fn main() -> std::process::ExitCode {
             }
         }
     }
+}
+
+fn main() -> std::process::ExitCode {
+    #[cfg(windows)]
+    if prompt::should_open() {
+        return command_exit_code(prompt::run().map(|()| false));
+    }
+    let cli = Cli::try_parse().unwrap_or_else(|e| {
+        let code = if e.use_stderr() { 64 } else { 0 };
+        let _ = e.print();
+        std::process::exit(code)
+    });
+    command_exit_code((|| {
+        let guard = resource::MemoryGuard::install()?;
+        install_cancel_handler()?;
+        run_command(cli, &guard)
+    })())
 }
