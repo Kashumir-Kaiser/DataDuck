@@ -7,8 +7,8 @@ Turn local Excel workbooks and delimited files into a single interactive HTML da
 Download `dataduck.exe` from [GitHub Releases](https://github.com/Kashumir-Kaiser/DataDuck/releases) and place it in your project folder. Double-click it to open the DataDuck prompt in that folder. The prompt already displays `.\DataDuck `, so type only the command and its arguments. Wrap paths containing spaces in double quotes.
 
 ```text
-.\DataDuck build "Sales data.xlsx" -o "Sales report.html"
-.\DataDuck inspect "Sales data.xlsx" --sheet "Monthly sales" --rows 20
+build "Sales data.xlsx" -o "Sales report.html"
+inspect "Sales data.xlsx" --sheet "Monthly sales" --rows 20
 ```
 
 Type `help` to see the commands or `exit` to close the prompt. You can run several commands in the same session.

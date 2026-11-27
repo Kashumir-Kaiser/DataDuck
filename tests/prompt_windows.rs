@@ -1,230 +1,169 @@
-//! Exercise the zero-argument launcher through a Windows pseudoconsole.
+//! Exercise the zero-argument launcher in a fresh Windows console.
 #![cfg(windows)]
 
-use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::mem::{size_of, zeroed};
-use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
+use std::mem::zeroed;
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::ptr::{null, null_mut};
-use std::sync::mpsc::{channel, Receiver};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::{
-    Console::{ClosePseudoConsole, CreatePseudoConsole, COORD, HPCON},
-    Pipes::CreatePipe,
-    Threading::{
-        CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-        InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
-        WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
-        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW,
+    Console::{
+        GetConsoleScreenBufferInfo, ReadConsoleOutputCharacterW, WriteConsoleInputW,
+        CONSOLE_SCREEN_BUFFER_INFO, COORD, INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT,
+        KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
     },
+    Threading::CREATE_NEW_CONSOLE,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 const PROMPT: &str = r".\DataDuck";
+const HELPER: &str = "run_prompt_in_owned_console";
+const HELPER_ROOT: &str = "DATADUCK_TEST_CONSOLE_ROOT";
 
-fn wide(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain([0]).collect()
-}
+struct Process(Child);
 
-fn pipe() -> io::Result<(File, File)> {
-    let (mut read, mut write) = (null_mut(), null_mut());
-    // Both handles are initialized on success and then transferred to File.
-    unsafe {
-        if CreatePipe(&mut read, &mut write, null(), 0) == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok((File::from_raw_handle(read), File::from_raw_handle(write)))
-    }
-}
-
-struct Console(HPCON);
-
-impl Drop for Console {
-    fn drop(&mut self) {
-        unsafe { ClosePseudoConsole(self.0) };
-    }
-}
-
-struct Attributes(Vec<usize>);
-
-impl Attributes {
-    fn init() -> io::Result<Self> {
-        let mut bytes = 0;
-        unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut bytes) };
-        let mut storage = vec![0; bytes.div_ceil(size_of::<usize>())];
-        // An array of machine words gives the opaque list suitable alignment.
-        if unsafe {
-            InitializeProcThreadAttributeList(storage.as_mut_ptr().cast(), 1, 0, &mut bytes)
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self(storage))
-    }
-}
-
-impl Drop for Attributes {
-    fn drop(&mut self) {
-        unsafe { DeleteProcThreadAttributeList(self.0.as_mut_ptr().cast()) };
-    }
-}
-
-struct Child(OwnedHandle);
-
-impl Child {
-    fn handle(&self) -> HANDLE {
-        self.0.as_raw_handle()
-    }
-
-    fn wait(&self) -> u32 {
-        assert_eq!(
-            unsafe { WaitForSingleObject(self.handle(), TIMEOUT.as_millis() as u32) },
-            WAIT_OBJECT_0,
-            "DataDuck did not exit after the exit command"
-        );
-        let mut code = 0;
-        assert_ne!(unsafe { GetExitCodeProcess(self.handle(), &mut code) }, 0);
-        code
-    }
-}
-
-impl Drop for Child {
-    fn drop(&mut self) {
-        // On a failed assertion, stop the process before closing its pseudoconsole.
-        if unsafe { WaitForSingleObject(self.handle(), 0) } == WAIT_TIMEOUT {
-            unsafe {
-                TerminateProcess(self.handle(), 1);
-                WaitForSingleObject(self.handle(), 2000);
+impl Process {
+    fn wait(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
+        let end = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(status);
             }
+            if Instant::now() >= end {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "console process timed out",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        if self.0.try_wait().is_ok_and(|status| status.is_none()) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
         }
     }
 }
 
 struct Session {
-    // Drop order matters: first terminate the child, then close its pseudoconsole.
-    child: Child,
-    _console: Console,
+    child: Process,
     input: File,
-    output: Receiver<Vec<u8>>,
-    screen: Vec<u8>,
+    output: File,
     cursor: usize,
 }
 
 impl Session {
     fn start(exe: &Path, cwd: &Path) -> io::Result<Self> {
-        let (console_input, input) = pipe()?;
-        let (mut output, console_output) = pipe()?;
-        // ConPTY requires asynchronous draining of its output pipe. Start before spawning
-        // so boot messages and cleanup can never block on the synchronous pipe buffer.
-        let (send, receive) = channel();
-        std::thread::spawn(move || {
-            let mut bytes = [0; 4096];
-            while let Ok(count) = output.read(&mut bytes) {
-                if count == 0 || send.send(bytes[..count].to_vec()).is_err() {
-                    break;
-                }
-            }
-        });
-        let mut console = 0;
-        let result = unsafe {
-            CreatePseudoConsole(
-                COORD { X: 160, Y: 40 },
-                console_input.as_raw_handle(),
-                console_output.as_raw_handle(),
-                0,
-                &mut console,
-            )
-        };
-        if result < 0 {
-            return Err(io::Error::other(format!(
-                "CreatePseudoConsole: {result:#x}"
-            )));
-        }
-        let console = Console(console);
-        let mut attributes = Attributes::init()?;
-        let list = attributes.0.as_mut_ptr().cast();
-        let application = wide(exe.as_os_str());
-        let directory = wide(cwd.as_os_str());
-        let mut argument = OsString::from("\"");
-        argument.push(exe.as_os_str());
-        argument.push("\"");
-        let mut arguments = wide(&argument);
-        let mut info: STARTUPINFOEXW = unsafe { zeroed() };
-        info.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-        info.lpAttributeList = list;
-        let mut process: PROCESS_INFORMATION = unsafe { zeroed() };
-        unsafe {
-            if UpdateProcThreadAttribute(
-                list,
-                0,
-                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                console.0 as _,
-                size_of::<HPCON>(),
-                null_mut(),
-                null(),
-            ) == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            if CreateProcessW(
-                application.as_ptr(),
-                arguments.as_mut_ptr(),
-                null(),
-                null(),
-                0,
-                EXTENDED_STARTUPINFO_PRESENT,
-                null(),
-                directory.as_ptr(),
-                &info.StartupInfo,
-                &mut process,
-            ) == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            drop(OwnedHandle::from_raw_handle(process.hThread));
-        }
-        drop(console_input);
-        drop(console_output);
+        // The CI runner redirects its standard streams. Pass explicit console handles
+        // to DataDuck so the child sees the same streams it gets from Explorer.
+        let input = OpenOptions::new().read(true).write(true).open("CONIN$")?;
+        let output = OpenOptions::new().read(true).write(true).open("CONOUT$")?;
+        let child = Command::new(exe)
+            .current_dir(cwd)
+            .stdin(input.try_clone()?)
+            .stdout(output.try_clone()?)
+            .stderr(output.try_clone()?)
+            .spawn()?;
         Ok(Self {
-            child: Child(unsafe { OwnedHandle::from_raw_handle(process.hProcess) }),
-            _console: console,
+            child: Process(child),
             input,
-            output: receive,
-            screen: Vec::new(),
+            output,
             cursor: 0,
         })
     }
 
-    fn enter(&mut self, line: &str) {
-        self.input
-            .write_all(format!("{line}\r").as_bytes())
-            .unwrap();
+    fn enter(&self, line: &str) -> io::Result<()> {
+        let records: Vec<_> = line
+            .encode_utf16()
+            .chain([u16::from(b'\r')])
+            .flat_map(|character| {
+                [1, 0].map(|down| INPUT_RECORD {
+                    EventType: KEY_EVENT as u16,
+                    Event: INPUT_RECORD_0 {
+                        KeyEvent: KEY_EVENT_RECORD {
+                            bKeyDown: down,
+                            wRepeatCount: 1,
+                            wVirtualKeyCode: if character == 13 { 13 } else { 0xe7 },
+                            wVirtualScanCode: 0,
+                            uChar: KEY_EVENT_RECORD_0 {
+                                UnicodeChar: character,
+                            },
+                            dwControlKeyState: 0,
+                        },
+                    },
+                })
+            })
+            .collect();
+        let mut written = 0;
+        // Windows copies the supplied key records into the console queue.
+        if unsafe {
+            WriteConsoleInputW(
+                self.input.as_raw_handle(),
+                records.as_ptr(),
+                records.len() as u32,
+                &mut written,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        assert_eq!(written as usize, records.len());
+        Ok(())
+    }
+
+    fn screen(&self) -> io::Result<Vec<u16>> {
+        // Capture the text cells through the current cursor line for progress checks.
+        // Unlike the helper's redirected stderr, this buffer contains the real prompt.
+        unsafe {
+            let mut info: CONSOLE_SCREEN_BUFFER_INFO = zeroed();
+            let handle = self.output.as_raw_handle();
+            if GetConsoleScreenBufferInfo(handle, &mut info) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let cells = info.dwSize.X as usize * (info.dwCursorPosition.Y as usize + 1);
+            let mut text = vec![0; cells];
+            let mut read = 0;
+            if ReadConsoleOutputCharacterW(
+                handle,
+                text.as_mut_ptr(),
+                cells as u32,
+                COORD { X: 0, Y: 0 },
+                &mut read,
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            text.truncate(read as usize);
+            Ok(text)
+        }
     }
 
     fn expect(&mut self, text: &str) {
+        let marker: Vec<_> = text.encode_utf16().collect();
         let until = Instant::now() + TIMEOUT;
         loop {
-            if let Some(found) = self.screen[self.cursor..]
-                .windows(text.len())
-                .position(|window| window == text.as_bytes())
-            {
-                self.cursor += found + text.len();
+            let screen = self.screen().unwrap();
+            if let Some(found) = screen.get(self.cursor..).and_then(|rest| {
+                rest.windows(marker.len())
+                    .position(|window| window == marker)
+            }) {
+                self.cursor += found + marker.len();
                 return;
             }
-            match self
-                .output
-                .recv_timeout(until.saturating_duration_since(Instant::now()))
-            {
-                Ok(bytes) => self.screen.extend(bytes),
-                Err(error) => panic!(
-                    "ConPTY output ended waiting for {text:?} ({error})\n{}",
-                    String::from_utf8_lossy(&self.screen)
-                ),
-            }
+            let status = self.child.0.try_wait().unwrap();
+            assert!(
+                status.is_none() && Instant::now() < until,
+                "Console did not show {text:?} (exit {status:?})\n{}",
+                String::from_utf16_lossy(&screen).trim_end(),
+            );
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 }
@@ -232,43 +171,92 @@ impl Session {
 #[test]
 fn opens_in_executable_folder_and_accepts_multiple_commands() {
     let base = tempfile::tempdir().unwrap();
-    let project = base.path().join("project folder");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", HELPER, "--ignored", "--nocapture"])
+        .env(HELPER_ROOT, base.path())
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut helper = Process(output);
+    let status = helper.wait(Duration::from_secs(60)).unwrap();
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    helper
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    helper
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(base
+        .path()
+        .join("project folder/sales report.html")
+        .is_file());
+}
+
+#[test]
+#[ignore = "launched by the console test in a separate Windows console"]
+fn run_prompt_in_owned_console() {
+    let Some(base) = std::env::var_os(HELPER_ROOT) else {
+        return;
+    };
+    let base = Path::new(&base);
+    let project = base.join("project folder");
     let data = project.join("input files");
     fs::create_dir_all(&data).unwrap();
     fs::write(data.join("sales data.csv"), "Model,Price\nDuck,1200\n").unwrap();
     let exe = project.join("DataDuck.exe");
     fs::copy(env!("CARGO_BIN_EXE_dataduck"), &exe).unwrap();
 
-    let mut session = Session::start(&exe, base.path()).unwrap();
+    let mut session = Session::start(&exe, base).unwrap();
     session.expect("Folder:");
     session.expect(PROMPT);
-    session.enter("invalid-command");
+    session.enter("invalid-command").unwrap();
     session.expect("unrecognized subcommand");
     session.expect("For more information");
     session.expect(PROMPT);
-    session.enter("help");
+    session.enter("help").unwrap();
     session.expect("Usage:");
     session.expect("Print version");
     session.expect(PROMPT);
-    session.enter(r#"inspect ".\input files\sales data.csv" --rows 2"#);
+    session
+        .enter(r#"inspect ".\input files\sales data.csv" --rows 2"#)
+        .unwrap();
     session.expect(r#"1="Duck""#);
     session.expect(r#"2="1200""#);
     session.expect(PROMPT);
-    session.enter(r#"build ".\input files\sales data.csv" -o "sales report.html""#);
+    session
+        .enter(r#"build ".\input files\sales data.csv" -o "sales report.html""#)
+        .unwrap();
     session.expect("1 accepted rows");
     session.expect(PROMPT);
 
     assert!(fs::read_to_string(project.join("sales report.html"))
         .unwrap()
         .contains(r#""values":["Duck","1200"]"#));
-    assert!(!base.path().join("sales report.html").exists());
-    session.enter("exit");
-    assert_eq!(session.child.wait(), 0);
+    assert!(!base.join("sales report.html").exists());
+    session.enter("exit").unwrap();
+    assert_eq!(session.child.wait(TIMEOUT).unwrap().code(), Some(0));
 }
 
 #[test]
 fn no_arguments_with_redirected_io_still_print_usage_and_exit() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dataduck"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dataduck"))
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(64));
