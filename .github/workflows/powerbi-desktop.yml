@@ -1,0 +1,41 @@
+name: Power BI Desktop acceptance
+on:
+  workflow_dispatch:
+  push:
+    branches: [verify-powerbi-desktop]
+permissions:
+  contents: read
+jobs:
+  desktop:
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build DataDuck and native model probe
+        run: |
+          cargo build --locked
+          dotnet publish scripts/windows-desktop/Probe -c Release -o target/desktop-probe
+      - name: Install the pinned Microsoft Power BI Desktop build
+        shell: pwsh
+        run: |
+          # Microsoft winget-pkgs manifest Microsoft.PowerBI 2.160.1151.0 (x64).
+          $url = 'https://download.microsoft.com/download/8/8/0/880BCA75-79DD-466A-927D-1ABF1F5454B0/PBIDesktopSetup-2026-11_x64.exe'
+          $installer = Join-Path $env:RUNNER_TEMP PowerBI-2.160.1151.0.exe
+          curl.exe --fail --location --retry 2 $url -o $installer
+          if ($LASTEXITCODE -ne 0) { throw "Download of Microsoft Power BI Desktop failed" }
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne '89ACE9881D43A350E205C93DA9681A8211A521B2CCD63211E1BAF6020EFDCB85') { throw 'Microsoft Desktop installer checksum mismatch' }
+          $install = Start-Process $installer -ArgumentList '-quiet -norestart ACCEPT_EULA=1 LANGUAGE=en-US ENABLECXP=0 DISABLE_UPDATE_NOTIFICATION=1' -Wait -PassThru
+          if ($install.ExitCode -notin @(0,3010)) { throw "Desktop installer exited $($install.ExitCode)" }
+      - name: Open, refresh, query, save and reopen the PBIP in Power BI Desktop
+        shell: powershell
+        run: ./scripts/windows-desktop/smoke.ps1 -Executable target/debug/dataduck.exe -Probe target/desktop-probe/Probe.dll -OutputRoot "$env:RUNNER_TEMP/desktop-acceptance"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-diagnostics
+          path: ${{ runner.temp }}/desktop-acceptance/diagnostics/*
+          if-no-files-found: ignore
