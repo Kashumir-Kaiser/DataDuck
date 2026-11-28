@@ -7,6 +7,10 @@ use anyhow::{bail, ensure, Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
 use num_bigint::BigInt;
 use serde::{ser::SerializeSeq, Deserialize, Serialize, Serializer};
+mod powerbi;
+use powerbi::ImportEvidence;
+pub use powerbi::{compare_numbers, export_value, HistogramSpec, ImportType};
+
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io::{BufReader, BufWriter, Write};
@@ -19,7 +23,7 @@ const SAMPLE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum Type {
+pub enum Type {
     #[default]
     Empty,
     Text,
@@ -322,6 +326,9 @@ impl Inference {
             types: vec![ColumnType::default(); width],
         }
     }
+    pub fn kinds(&self) -> impl Iterator<Item = Type> + '_ {
+        self.types.iter().map(|c| c.kind)
+    }
     pub fn observe(&mut self, row: &Row) -> Result<()> {
         for c in &row.cells {
             let t = self
@@ -372,29 +379,31 @@ impl Inference {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Ranked {
-    value: String,
-    count: u64,
+pub struct Ranked {
+    pub value: String,
+    pub count: u64,
 }
 #[derive(Debug, Serialize, Deserialize)]
-struct Bin {
-    label: String,
-    count: u64,
+pub struct Bin {
+    pub label: String,
+    pub count: u64,
 }
 #[derive(Serialize, Deserialize)]
-struct Column {
-    name: String,
-    kind: Type,
-    valid: u64,
-    missing: u64,
-    distinct: u64,
-    top: Vec<Ranked>,
-    other: u64,
-    min: Option<String>,
-    max: Option<String>,
-    mean: Option<f64>,
-    bins: Vec<Bin>,
-    missing_reasons: BTreeMap<String, u64>,
+pub struct Column {
+    pub name: String,
+    pub kind: Type,
+    pub valid: u64,
+    pub missing: u64,
+    pub distinct: u64,
+    pub top: Vec<Ranked>,
+    pub other: u64,
+    pub min: Option<String>,
+    pub max: Option<String>,
+    pub mean: Option<f64>,
+    pub bins: Vec<Bin>,
+    pub missing_reasons: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evidence: Option<ImportEvidence>,
 }
 #[derive(Serialize)]
 pub struct Sample {
@@ -408,6 +417,21 @@ pub struct Columns {
     file: ScratchFile,
     len: usize,
 }
+impl Columns {
+    /// Visit summaries in header order while keeping only one column in memory.
+    pub fn try_for_each(&self, mut visit: impl FnMut(usize, &Column) -> Result<()>) -> Result<()> {
+        let reader = BufReader::new(self.file.reopen()?);
+        let mut count = 0;
+        for value in serde_json::Deserializer::from_reader(reader).into_iter::<Column>() {
+            check_cancel()?;
+            ensure!(count < self.len, "unexpected extra column summary");
+            visit(count, &value?)?;
+            count += 1;
+        }
+        ensure!(count == self.len, "incomplete column summary");
+        Ok(())
+    }
+}
 impl Serialize for Columns {
     fn serialize<S: Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::Error;
@@ -415,7 +439,9 @@ impl Serialize for Columns {
         let mut seq = ser.serialize_seq(Some(self.len))?;
         let mut n = 0;
         for value in serde_json::Deserializer::from_reader(reader).into_iter::<Column>() {
-            seq.serialize_element(&value.map_err(S::Error::custom)?)?;
+            let mut column = value.map_err(S::Error::custom)?;
+            column.evidence = None;
+            seq.serialize_element(&column)?;
             n += 1;
         }
         if n != self.len {
@@ -446,6 +472,7 @@ pub struct Profiler {
     sample: Vec<Sample>,
     sample_cap: usize,
     preview: usize,
+    powerbi: bool,
 }
 fn clipped(value: &str, max: usize) -> String {
     if value.len() <= max {
@@ -490,7 +517,11 @@ impl Profiler {
             sample: Vec::new(),
             sample_cap,
             preview,
+            powerbi: false,
         })
+    }
+    pub fn enable_powerbi(&mut self) {
+        self.powerbi = true;
     }
     pub fn observe(&mut self, row: &Row, source: &str) -> Result<()> {
         self.rows = self.rows.checked_add(1).context("row count overflow")?;
@@ -509,18 +540,12 @@ impl Profiler {
                 *t.reasons.entry(c.value.clone()).or_default() += 1;
                 continue;
             }
-            let tmp;
-            let value = if self.inference.types[c.col].kind == Type::Text {
-                c.value.as_str()
-            } else {
-                tmp = match classify(c) {
-                    Value::Bool(b) => b.to_string(),
-                    Value::Number(d, _) => d.label(),
-                    Value::Date(d) => d.label(),
-                    Value::Text => bail!("inference mismatch in column {}", c.col + 1),
-                };
-                &tmp
-            };
+            if self.powerbi && c.value.len() > 32_000 {
+                ensure!(c.value.encode_utf16().take(32_001).count() <= 32_000,
+                    "{source} row {}, field {:?}: text exceeds the Power BI 32,000 UTF-16 unit limit", row.number, self.headers[c.col]);
+            }
+            let canonical = export_value(c, self.inference.types[c.col].kind)?;
+            let value = canonical.as_ref();
             t.valid += 1;
             self.sorter.push(c.col as u32, value.as_bytes())?;
             if let Some(s) = &mut sample {
@@ -545,6 +570,7 @@ impl Profiler {
             rows,
             tallies,
             sample,
+            powerbi,
             ..
         } = self;
         let mut writer = BufWriter::with_capacity(128 << 10, scratch.create()?);
@@ -555,12 +581,12 @@ impl Profiler {
         sorter.finish(|group, key, weight| {
             let group = group as usize;
             while pos < group {
-                emit(&mut writer, active.take(), inputs.by_ref(), rows)?;
+                emit(&mut writer, active.take(), inputs.by_ref(), rows, powerbi)?;
                 pos += 1;
             }
             if active.is_none() {
                 let ((name, ty), tally) = inputs.next().context("invalid sort group")?;
-                active = Some(Reduction::new(name, ty, tally, rows)?);
+                active = Some(Reduction::new(name, ty, tally, rows, powerbi)?);
             }
             active
                 .as_mut()
@@ -568,7 +594,7 @@ impl Profiler {
                 .add(std::str::from_utf8(key)?, weight)
         })?;
         while pos < len {
-            emit(&mut writer, active.take(), inputs.by_ref(), rows)?;
+            emit(&mut writer, active.take(), inputs.by_ref(), rows, powerbi)?;
             pos += 1;
         }
         writer.flush()?;
@@ -585,13 +611,14 @@ fn emit(
     r: Option<Reduction>,
     i: &mut impl Iterator<Item = ((String, ColumnType), Tally)>,
     rows: u64,
+    powerbi: bool,
 ) -> Result<()> {
     check_cancel()?;
     let r = match r {
         Some(r) => r,
         None => {
             let ((n, ty), ta) = i.next().context("missing column")?;
-            Reduction::new(n, ty, ta, rows)?
+            Reduction::new(n, ty, ta, rows, powerbi)?
         }
     };
     serde_json::to_writer(&mut *w, &r.finish()?)?;
@@ -651,7 +678,8 @@ impl DecimalBins {
         label.parse::<f64>().ok().filter(|x| x.is_finite())
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum Period {
     Day,
     Week,
@@ -685,13 +713,14 @@ impl Period {
         })
     }
 }
-struct CalendarBins {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarSpec {
     period: Period,
     first: i32,
     last: i32,
     stride: i32,
 }
-impl CalendarBins {
+impl CalendarSpec {
     fn new(lo: NaiveDate, hi: NaiveDate) -> Self {
         for period in [
             Period::Day,
@@ -729,10 +758,10 @@ struct Reduction {
     col: Column,
     mass: u64,
     number: Option<DecimalBins>,
-    days: Option<CalendarBins>,
+    days: Option<CalendarSpec>,
 }
 impl Reduction {
-    fn new(name: String, ty: ColumnType, t: Tally, rows: u64) -> Result<Self> {
+    fn new(name: String, ty: ColumnType, t: Tally, rows: u64, powerbi: bool) -> Result<Self> {
         let missing = rows
             .checked_sub(t.valid)
             .context("multiple values for one row and column")?;
@@ -756,6 +785,7 @@ impl Reduction {
             mean: None,
             bins: vec![],
             missing_reasons: reasons,
+            evidence: powerbi.then(ImportEvidence::default),
         };
         let mut number = None;
         let mut days = None;
@@ -791,7 +821,7 @@ impl Reduction {
         if let Some((lo, hi)) = ty.dates {
             col.min = Some(lo.label());
             col.max = Some(hi.label());
-            let calendar = CalendarBins::new(lo.dt.date(), hi.dt.date());
+            let calendar = CalendarSpec::new(lo.dt.date(), hi.dt.date());
             for i in (calendar.first..=calendar.last).step_by(calendar.stride as usize) {
                 col.bins.push(Bin {
                     label: calendar.period.label(i, calendar.stride)?,
@@ -830,12 +860,18 @@ impl Reduction {
         if let Some(h) = &mut self.number {
             let (v, _) =
                 Decimal::parse_with_limit(key, false, 1024).context("invalid canonical number")?;
+            if let Some(evidence) = &mut self.col.evidence {
+                evidence.numeric(&v);
+            }
             let i = h.cuts.partition_point(|b| b <= &v);
             self.col.bins[i].count += weight;
             h.accumulate(&v, weight);
         }
         if let Some(calendar) = &self.days {
             let v = Temporal::parse(key).context("invalid canonical date")?;
+            if let Some(evidence) = &mut self.col.evidence {
+                evidence.temporal(&v);
+            }
             let i = calendar.bin(v.dt.date());
             self.col
                 .bins
@@ -997,7 +1033,7 @@ mod tests {
             ("2400-01-01", "2020"),
         ] {
             let hi = NaiveDate::parse_from_str(end, "%Y-%m-%d")?;
-            let bins = CalendarBins::new(lo, hi);
+            let bins = CalendarSpec::new(lo, hi);
             assert_eq!(bins.period.label(bins.first, bins.stride)?, first);
             assert!(bins.bin(hi) < TIME_BINS);
         }
@@ -1043,6 +1079,145 @@ mod tests {
         assert_eq!(report(1, &rows)?["sample"], r["sample"]);
         Ok(())
     }
+    fn powerbi_profile(width: usize, rows: &[Row]) -> Result<Profile> {
+        let scratch = Scratch::new(None, 64 << 20)?;
+        let mut inference = Inference::new(width);
+        for r in rows {
+            inference.observe(r)?;
+        }
+        let headers = (0..width).map(|i| format!("c{i}")).collect::<Vec<_>>();
+        let mut p = Profiler::new(&headers, inference, &scratch)?;
+        p.enable_powerbi();
+        for r in rows {
+            p.observe(r, "s")?;
+        }
+        p.finish()
+    }
+
+    #[test]
+    fn full_profile_proves_import_precision_without_changing_html() -> Result<()> {
+        use ImportType::*;
+        let rows = [
+            row(
+                1,
+                &[
+                    (0, "2020.000", Kind::Number),
+                    (1, "-922337203685477.5807", Kind::Number),
+                    (2, "0.123456789012345", Kind::Number),
+                    (3, "0.1234567890123456", Kind::Number),
+                    (4, "9223372036854775806", Kind::Number),
+                    (5, "9223372036854775807", Kind::Number),
+                    (6, "2020-01-01T01:00:00.010+01:00", Kind::Date),
+                    (7, "2020-01-01T00:00:00.001Z", Kind::Date),
+                    (8, "2020-01-01T00:00:00Z", Kind::Date),
+                    (9, "1800-01-01", Kind::Date),
+                    (10, "00100", Kind::Auto),
+                    (11, "1e308", Kind::Number),
+                    (12, "1e-500", Kind::Number),
+                    (13, "true", Kind::Auto),
+                ],
+            ),
+            row(
+                2,
+                &[
+                    (0, "2021", Kind::Number),
+                    (8, "2020-01-02T00:00:00", Kind::Date),
+                ],
+            ),
+        ];
+        let p = powerbi_profile(15, &rows)?;
+        let expected = [
+            Whole, Fixed, Double, Text, Whole, Text, DateTime, Text, Text, Text, Text, Double,
+            Text, Boolean, Text,
+        ];
+        p.columns.try_for_each(|i, c| {
+            assert_eq!(c.import_type()?, expected[i], "{}", c.name);
+            if i == 0 {
+                assert!(c.integral());
+                assert!(c.supports_import(Fixed)?);
+            }
+            if i == 2 {
+                assert!(!c.supports_import(Fixed)?);
+            }
+            if i == 6 {
+                assert!(c.utc());
+                assert_eq!(c.min.as_deref(), Some("2020-01-01T00:00:00.010Z"));
+            }
+            if i == 10 {
+                assert_eq!(c.top[0].value, "00100");
+            }
+            Ok(())
+        })?;
+        assert_eq!(serde_json::to_value(&p)?, report(15, &rows)?);
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_histogram_assigns_exact_edges_and_unique_short_labels() -> Result<()> {
+        // The interval edges differ below the precision of a binary64.
+        let first = 100_000_000_000_000_000u64;
+        let rows: Vec<_> = (0..=32)
+            .map(|i| row(i + 1, &[(0, &(first + i).to_string(), Kind::Number)]))
+            .collect();
+        let p = powerbi_profile(1, &rows)?;
+        p.columns.try_for_each(|_, c| {
+            let spec: HistogramSpec =
+                serde_json::from_slice(&serde_json::to_vec(&c.histogram()?)?)?;
+            assert_eq!(spec.key(&(first - 1).to_string())?, 0);
+            assert_eq!(spec.key(&(first + 33).to_string())?, 33);
+            let labels = spec.rows()?;
+            let unique: std::collections::BTreeSet<_> =
+                labels[1..=32].iter().map(|x| x.1.as_str()).collect();
+            assert_eq!(unique.len(), 32);
+            assert!(unique.iter().all(|v| v.len() <= 12));
+            for i in 0..=32 {
+                assert_eq!(spec.key(&(first + i).to_string())?, (i + 1).min(32) as i32);
+            }
+            for (i, bin) in c.bins.iter().enumerate() {
+                assert_eq!(labels[i + 1].2, bin.label);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn frozen_calendar_extends_with_stable_keys_and_rejects_oversize_span() -> Result<()> {
+        let rows = [
+            row(1, &[(0, "2025-02-01", Kind::Date)]),
+            row(2, &[(0, "2025-02-03", Kind::Date)]),
+        ];
+        let p = powerbi_profile(1, &rows)?;
+        p.columns.try_for_each(|_, c| {
+            let mut spec = c.calendar()?;
+            let feb = spec.key("2025-02-02")?;
+            let start = spec.key("2025-02-01")?;
+            spec.extend("2025-01-30", "2025-02-04")?;
+            assert_eq!(spec.key("2025-02-02")?, feb);
+            assert_eq!(spec.rows()?.first().unwrap().0, start - 2);
+            assert_eq!(spec.rows()?.len(), 6);
+            assert!(spec.extend("2000-01-01", "2025-03-05").is_err());
+            assert_eq!(spec.rows()?.len(), 6);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn utf16_guard_points_to_source_and_accepts_exact_boundary() -> Result<()> {
+        let at_limit = "🦆".repeat(16_000);
+        powerbi_profile(1, &[row(90, &[(0, &at_limit, Kind::Text)])])?;
+        let oversized = format!("{at_limit}z");
+        let error = powerbi_profile(1, &[row(91, &[(0, &oversized, Kind::Text)])])
+            .err()
+            .expect("oversize text");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("s row 91") && message.contains("c0"),
+            "{message}"
+        );
+        assert!(report(1, &[row(91, &[(0, &oversized, Kind::Text)])]).is_ok());
+        Ok(())
+    }
+
     #[test]
     fn canonical_signs_zeros_and_limits() {
         for v in ["000", "-.00", "+0.0e34"] {

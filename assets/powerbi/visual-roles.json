@@ -1,0 +1,80 @@
+{
+  "clusteredBarChart": {
+    "visualType": "clusteredBarChart",
+    "query": {
+      "queryState": {
+        "Category": {
+          "projections": []
+        },
+        "Y": {
+          "projections": []
+        },
+        "Tooltips": {
+          "projections": []
+        }
+      }
+    }
+  },
+  "clusteredColumnChart": {
+    "visualType": "clusteredColumnChart",
+    "query": {
+      "queryState": {
+        "Category": {
+          "projections": []
+        },
+        "Y": {
+          "projections": []
+        },
+        "Tooltips": {
+          "projections": []
+        }
+      }
+    }
+  },
+  "lineChart": {
+    "visualType": "lineChart",
+    "query": {
+      "queryState": {
+        "Category": {
+          "projections": []
+        },
+        "Y": {
+          "projections": []
+        },
+        "Tooltips": {
+          "projections": []
+        }
+      }
+    }
+  },
+  "tableEx": {
+    "visualType": "tableEx",
+    "query": {
+      "queryState": {
+        "Values": {
+          "projections": []
+        }
+      }
+    }
+  },
+  "slicer": {
+    "visualType": "slicer",
+    "query": {
+      "queryState": {
+        "Values": {
+          "projections": []
+        }
+      }
+    }
+  },
+  "cardVisual": {
+    "visualType": "cardVisual",
+    "query": {
+      "queryState": {
+        "Data": {
+          "projections": []
+        }
+      }
+    }
+  }
+}

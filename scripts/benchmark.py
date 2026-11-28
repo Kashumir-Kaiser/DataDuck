@@ -82,7 +82,7 @@ def excel_column(index):
     return result
 
 
-def generate_xlsx(folder, case, target, small):
+def generate_xlsx(folder, case, target, small, sparse_columns=16384):
     with ZipFile(folder / 'book.xlsx', 'w', compression=ZIP_DEFLATED, compresslevel=3, allowZip64=True) as book:
         shared = case == 'xlsx'
         xlsx_parts(book, shared)
@@ -102,7 +102,7 @@ def generate_xlsx(folder, case, target, small):
         with book.open('xl/worksheets/sheet1.xml', 'w', force_zip64=True) as sheet:
             sheet.write(f'<worksheet xmlns="{SHEET_NS}"><sheetData>'.encode())
             if case == 'sparse':
-                columns = 64 if small else 16384
+                columns = 64 if small else sparse_columns
                 sheet.write(b'<row r="1">')
                 for i in range(1, columns + 1):
                     sheet.write(f'<c r="{excel_column(i)}1" t="inlineStr"><is><t>Field {i}</t></is></c>'.encode())
@@ -303,8 +303,8 @@ def main():
                 stream.seek(max(0, log.stat().st_size-4096))
                 result['cli_summary'] = stream.read().decode('utf-8', 'replace').strip()
             result['validation_error'] = verify_report(html, case, rows) if html.exists() else 'missing report'
-            scratch_metric = re.search(r'peak scratch (\d+) bytes', result['cli_summary'])
-            result['peak_scratch_bytes'] = int(scratch_metric[1]) if scratch_metric else None
+            scratch_peaks = [int(n) for n in re.findall(r'peak scratch (\d+) bytes', result['cli_summary'])]
+            result['peak_scratch_bytes'] = max([result['sampled_scratch_bytes'], *scratch_peaks])
             # Tiny processes can exit between Windows polling intervals; use their final native counters.
             metrics = re.search(r'peak working set (\d+) bytes, peak commit (\d+) bytes', result['cli_summary'])
             if metrics:

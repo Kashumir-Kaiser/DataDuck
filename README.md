@@ -30,6 +30,59 @@ For optional exports, choose fresh destinations. Each logical table gets a CSV n
 .\dataduck.exe build .\downloads --config .\recipe.toml -o .\report.html --clean-dir .\cleaned --issues .\issues.ndjson
 ```
 
+## Export an editable Power BI project
+
+In the DataDuck prompt, run either of these commands with a fresh output directory:
+
+```text
+powerbi export "Automobile-Dataset.xlsx" -o PricesBI
+powerbi export ".\inputs" --recursive -o MonthlyBI --charts charts.json --html monthly.html
+```
+
+Open `PricesBI\PricesBI.pbip` in 64-bit Power BI Desktop and select **Refresh** to load the cleaned rows. If prompted, enable the Desktop project features used by your Desktop build. Keep the whole project folder together. The import uses local CSV partitions under `DataDuck\snapshots`; the original workbook is only needed for a later DataDuck run. When moving the project, open **Transform data → Edit parameters**, set `DataDuckSnapshotFolder` to the snapshot's full directory path on that computer, and refresh.
+
+Analysis pages use native visuals and explicit measures on the cleaned facts. Selecting a category filters other visuals on the same page. The **Export profile** page shows the whole snapshot, including missing values and skipped sources. DataDuck selects up to four logical tables for analysis pages and up to eight visuals per selected table. The model includes all supported cleaned tables. Each snapshot's `chart-decisions.ndjson` records the original layout decisions, including candidates that missed the page budget.
+
+| Profile evidence | Default visual |
+|---|---|
+| All missing, constant, identifier, or nearly unique text | Statistics and record detail |
+| Boolean or exactly the pair 0 and 1 | Two-category counts |
+| Integral four-digit year field | Ordered counts by year value |
+| Typed date or datetime | Chronological record counts, according to populated periods |
+| Integral field with 2–12 distinct values | Ordered value counts |
+| Other numeric field | Histogram with compact labels and exact interval tooltips |
+| Text with 2–12 values | Category counts |
+| Other repeated text | Top 10 and an exact Other group |
+
+DataDuck recognizes common price fields for averaging. Business comparisons use a dimension and an approved measure in the same table. They require at least 10 records with both values and at least two populated groups. To declare a sum or choose a primary measure or dimension, pass `--charts` with a version-1 JSON file. Source names match the input-relative labels used by the source audit. For example:
+
+```json
+{
+  "version": 1,
+  "tables": [{
+    "match": { "source": "Automobile-Dataset.xlsx", "sheet": "automobile_dataset" },
+    "fields": {
+      "Selling_Price": { "role": "measure", "aggregate": "average", "priority": 100 },
+      "Make": { "role": "category", "priority": 100 },
+      "Engine_Size": { "role": "numeric", "priority": 90 },
+      "Year": { "role": "year" }
+    }
+  }]
+}
+```
+
+Field roles are `identifier`, `category`, `year`, `event_date`, `numeric`, `measure`, and `profile_only`. Measures accept `average`, `sum`, `min`, and `max`. Field and table priorities range from 0 through 100. Keep input cleaning and header overrides in the existing `--config` TOML file.
+
+### Refresh a report you edited
+
+```text
+powerbi update-data "Automobile-Dataset.xlsx" -o PricesBI
+```
+
+Set **DataDuckSnapshotFolder** in Desktop to the directory printed by the command and select **Refresh**. The command publishes a content-addressed snapshot and preserves your PBIR pages and TMDL measures. Repeating an identical update reuses the verified snapshot. To roll back, select a previous snapshot directory. A changed schema requires a fresh export. The original histogram cuts, category membership, and calendar grain stay fixed for saved filters. New numerical extremes get overflow bins, new categories enter Other, and calendar lookups can extend to 512 periods at the original grain.
+
+The Power BI exporter shares DataDuck's Windows memory limit, SSD scratch, and transactional source cleaning. Combined HTML and Power BI exports read the original workbooks once. Power BI Desktop uses its own memory during refresh. Text values above 32,000 UTF-16 units or a generated model above the 16,000 table-plus-column budget produce a diagnostic before publication. Numeric values beyond the supported import precision are preserved as text, with the exact DataDuck profile available.
+
 ## How data is interpreted
 
 - Matching normalized header names form one logical table. Reordered columns align automatically. An added or removed column creates another table. The first contributing source supplies the display names and order.

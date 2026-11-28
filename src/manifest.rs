@@ -58,6 +58,20 @@ impl Catalog {
         self.count += 1;
         Ok(())
     }
+    pub fn try_for_each(&self, mut visit: impl FnMut(Source) -> Result<()>) -> Result<()> {
+        ensure!(self.file.buffer().is_empty(), "unsealed source manifest");
+        let mut reader = BufReader::new(self.file.get_ref().reopen()?);
+        let mut line = Vec::new();
+        let mut count = 0;
+        while reader.read_until(b'\n', &mut line)? != 0 {
+            crate::resource::check_cancel()?;
+            visit(serde_json::from_slice(&line)?)?;
+            count += 1;
+            line.clear();
+        }
+        ensure!(count == self.count, "incomplete source manifest");
+        Ok(())
+    }
     pub fn seal(&mut self) -> Result<()> {
         self.file.flush()?;
         Ok(())

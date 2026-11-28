@@ -26,11 +26,36 @@ jobs:
       - run: cargo build --locked --release
       - name: Smoke-test the release executable
         run: python scripts/benchmark.py --exe target/release/dataduck${{ runner.os == 'Windows' && '.exe' || '' }} --small --output smoke.json
+      - name: Measure Power BI export modes on synthetic inputs
+        run: python scripts/benchmark_powerbi.py --exe target/release/dataduck${{ runner.os == 'Windows' && '.exe' || '' }} --small --repeats 1 --output powerbi-smoke.json
+      - name: Fetch pinned Microsoft JSON schemas for offline validation
+        if: runner.os == 'Windows'
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/json-schemas
+          ref: 582c790d5862f8330d839bffdcf81ba23e984c96
+          path: target/microsoft-json-schemas
+          persist-credentials: false
+      - name: Validate generated PBIR and PBIP
+        if: runner.os == 'Windows'
+        run: |
+          python -m pip install jsonschema==4.26.0
+          python scripts/verify_powerbi.py --exe target/release/dataduck.exe --schemas target/microsoft-json-schemas --project target/ci-verification/Report
+      - name: Install .NET SDK for Tabular Object Model validation
+        if: runner.os == 'Windows'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Load TMDL and resolve report bindings with Microsoft TOM
+        if: runner.os == 'Windows'
+        run: dotnet run --project scripts/verify-model -c Release -- target/ci-verification/Report
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: smoke-${{ runner.os }}
-          path: smoke.json
+          path: |
+            smoke.json
+            powerbi-smoke.json
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Windows'
         with:
@@ -64,16 +89,25 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 360
     needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [csv, many, xlsx, expansion, sparse, unique, repeated]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: dataduck-windows-x64
           path: bin
+      - name: Download the HTML-only reference build
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://github.com/Kashumir-Kaiser/DataDuck/releases/download/v0.1.2/dataduck.exe -OutFile bin/baseline.exe
+          if ((Get-FileHash bin/baseline.exe -Algorithm SHA256).Hash -ne '7c1be96e026679360cd0cd5f74e9efc9952530898035f16218d8e87018c18cac') { throw 'Unexpected reference executable checksum' }
       - name: Benchmark native Windows
-        run: python scripts/benchmark.py --exe bin/dataduck.exe --output benchmark.json
+        run: python scripts/benchmark_powerbi.py --exe bin/dataduck.exe --case ${{ matrix.case }} --baseline-exe bin/baseline.exe --output benchmark.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: windows-benchmark
+          name: windows-benchmark-${{ matrix.case }}
           path: benchmark.json

@@ -3,6 +3,7 @@ mod discovery;
 mod layout;
 mod manifest;
 mod model;
+mod powerbi;
 mod profile;
 #[cfg(windows)]
 mod prompt;
@@ -38,6 +39,9 @@ struct Cli {
 enum Command {
     /// Clean, profile and publish a standalone dashboard.
     Build(Build),
+    /// Export or refresh an editable Power BI Desktop project.
+    #[command(name = "powerbi", subcommand)]
+    PowerBi(powerbi::Command),
     /// Preview original rows, sheet names, and header detection.
     Inspect(Inspect),
 }
@@ -294,11 +298,13 @@ struct Part {
     rows: resource::Parked,
     hints: resource::Parked,
     source: String,
+    path_len: usize,
 }
 struct Group {
     name: String,
     headers: resource::Parked,
     parts: Vec<Part>,
+    accepted: u64,
 }
 struct Dataset {
     quiet: bool,
@@ -431,6 +437,7 @@ impl Dataset {
                 name: format!("Table {}", i + 1),
                 headers: file,
                 parts: vec![],
+                accepted: 0,
             });
             self.keys.entry(key).or_default().push(i);
             (i, headers.clone())
@@ -451,7 +458,9 @@ impl Dataset {
             Some(n) => format!("{path} / {n}"),
             None => path.into(),
         };
+        g.accepted += c.audit.source.rows;
         g.parts.push(Part {
+            path_len: path.len(),
             rows: c.writer.into_inner().map_err(|e| e.into_error())?.park()?,
             hints,
             source,
@@ -758,6 +767,117 @@ fn write_csv(w: &mut csv::Writer<VolumeWriter<File>>, r: &Row) -> Result<()> {
     }))?;
     Ok(())
 }
+fn ingest(
+    files: Vec<Input>,
+    cfg: &Config,
+    s: &Scratch,
+    quiet: bool,
+    issues: &mut Option<IssueWriter>,
+) -> Result<Dataset> {
+    let mut data = Dataset {
+        quiet,
+        sources: manifest::Catalog::new(s)?,
+        groups: Vec::new(),
+        keys: HashMap::new(),
+    };
+    for f in files {
+        s.check()?;
+        if !quiet {
+            eprintln!("Reading {} ({} bytes)", f.label, f.path.metadata()?.len());
+        }
+        if extension(&f.path) == "xlsx" {
+            let mut w = match xlsx::Workbook::open(&f.path, s) {
+                Ok(w) => w,
+                Err(e) => {
+                    s.check()?;
+                    data.skip(&f.label, None, e, issues)?;
+                    continue;
+                }
+            };
+            for i in 0..w.sheets().len() {
+                let name = w.sheets()[i].name.clone();
+                let rule = cfg
+                    .rule_for(&f.label, Some(&name))
+                    .context(InvalidSettings)?;
+                if w.sheets()[i].hidden && rule.is_none_or(|r| r.sheet.is_none()) {
+                    continue;
+                }
+                let rule = match effective_rule(&mut w, i, rule) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        s.check()?;
+                        data.skip(&f.label, Some(&name), e, issues)?;
+                        continue;
+                    }
+                };
+                data.capture(&f.label, Some(&name), &rule, s, issues, |cb| {
+                    w.read(i, cb)?;
+                    Ok("XLSX".into())
+                })?;
+            }
+        } else {
+            let default = SourceRule::default();
+            let r = cfg
+                .rule_for(&f.label, None)
+                .context(InvalidSettings)?
+                .unwrap_or(&default);
+            data.capture(&f.label, None, r, s, issues, |cb| read_text(&f.path, r, cb))?;
+        }
+    }
+    ensure!(
+        !data.groups.is_empty(),
+        "no usable source; inspect the inputs and source diagnostics above"
+    );
+    data.sources.seal()?;
+    data.keys.clear();
+    data.keys.shrink_to_fit();
+    Ok(data)
+}
+
+impl Part {
+    fn replay(
+        &self,
+        order: Option<&[usize]>,
+        mut visit: impl FnMut(&Row) -> Result<()>,
+    ) -> Result<()> {
+        let (mut map, _): (Vec<usize>, serde::de::IgnoredAny) =
+            serde_json::from_reader(BufReader::new(self.hints.open()?))?;
+        if let Some(order) = order {
+            for col in &mut map {
+                *col = order[*col];
+            }
+        }
+        let same = map.iter().copied().eq(0..map.len());
+        segment::replay(
+            &mut BufReader::with_capacity(256 << 10, self.rows.open()?),
+            |mut row| {
+                resource::check_cancel()?;
+                if !same {
+                    remap(&mut row, &map);
+                }
+                visit(&row)
+            },
+        )
+    }
+}
+
+impl Group {
+    fn inference(&self, width: usize, order: Option<&[usize]>) -> Result<Inference> {
+        let mut inference = Inference::new(width);
+        for part in &self.parts {
+            let (mut map, hints): (Vec<usize>, Inference) =
+                serde_json::from_reader(BufReader::new(part.hints.open()?))?;
+            if let Some(order) = order {
+                for col in &mut map {
+                    *col = order[*col];
+                }
+            }
+            inference.merge_mapped(&hints, &map)?;
+        }
+        Ok(inference)
+    }
+}
+
 fn build(o: Build, mem: &resource::MemoryGuard) -> Result<bool> {
     let start = std::time::Instant::now();
     let cfg = config(&o.common)?;
@@ -804,64 +924,7 @@ fn build(o: Build, mem: &resource::MemoryGuard) -> Result<bool> {
             files.len()
         );
     }
-    let mut data = Dataset {
-        quiet: o.quiet,
-        sources: manifest::Catalog::new(&s)?,
-        groups: Vec::new(),
-        keys: HashMap::new(),
-    };
-    for f in files {
-        s.check()?;
-        if !o.quiet {
-            eprintln!("Reading {} ({} bytes)", f.label, f.path.metadata()?.len());
-        }
-        if extension(&f.path) == "xlsx" {
-            let mut w = match xlsx::Workbook::open(&f.path, &s) {
-                Ok(w) => w,
-                Err(e) => {
-                    s.check()?;
-                    data.skip(&f.label, None, e, &mut issues)?;
-                    continue;
-                }
-            };
-            for i in 0..w.sheets().len() {
-                let name = w.sheets()[i].name.clone();
-                let rule = cfg
-                    .rule_for(&f.label, Some(&name))
-                    .context(InvalidSettings)?;
-                if w.sheets()[i].hidden && rule.is_none_or(|r| r.sheet.is_none()) {
-                    continue;
-                }
-                let rule = match effective_rule(&mut w, i, rule) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        s.check()?;
-                        data.skip(&f.label, Some(&name), e, &mut issues)?;
-                        continue;
-                    }
-                };
-                data.capture(&f.label, Some(&name), &rule, &s, &mut issues, |cb| {
-                    w.read(i, cb)?;
-                    Ok("XLSX".into())
-                })?;
-            }
-        } else {
-            let default = SourceRule::default();
-            let r = cfg
-                .rule_for(&f.label, None)
-                .context(InvalidSettings)?
-                .unwrap_or(&default);
-            data.capture(&f.label, None, r, &s, &mut issues, |cb| {
-                read_text(&f.path, r, cb)
-            })?;
-        }
-    }
-    ensure!(
-        !data.groups.is_empty(),
-        "no usable source; inspect the inputs and source diagnostics above"
-    );
-    data.sources.seal()?;
-    drop(data.keys);
+    let data = ingest(files, &cfg, &s, o.quiet, &mut issues)?;
     let mut profiles = Vec::new();
     let mut sections = Vec::new();
     for (gi, g) in data.groups.into_iter().enumerate() {
@@ -875,12 +938,7 @@ fn build(o: Build, mem: &resource::MemoryGuard) -> Result<bool> {
                 g.parts.len()
             );
         }
-        let mut inf = Inference::new(headers.len());
-        for part in &g.parts {
-            let (map, hints): (Vec<usize>, Inference) =
-                serde_json::from_reader(BufReader::new(part.hints.open()?))?;
-            inf.merge_mapped(&hints, &map)?;
-        }
+        let inf = g.inference(headers.len(), None)?;
         let mut profiler = Profiler::new(&headers, inf, &s)?;
         let mut csv = if let Some(d) = &clean {
             let f = File::create(d.path().join(format!("table-{:04}.csv", gi + 1)))?;
@@ -897,23 +955,13 @@ fn build(o: Build, mem: &resource::MemoryGuard) -> Result<bool> {
             None
         };
         for part in g.parts {
-            let (map, _): (Vec<usize>, serde::de::IgnoredAny) =
-                serde_json::from_reader(BufReader::new(part.hints.open()?))?;
-            let same = map.iter().copied().eq(0..map.len());
-            segment::replay(
-                &mut BufReader::with_capacity(256 << 10, part.rows.open()?),
-                |mut r| {
-                    resource::check_cancel()?;
-                    if !same {
-                        remap(&mut r, &map);
-                    }
-                    profiler.observe(&r, &part.source)?;
-                    if let Some(w) = &mut csv {
-                        write_csv(w, &r)?;
-                    }
-                    Ok(())
-                },
-            )?;
+            part.replay(None, |r| {
+                profiler.observe(r, &part.source)?;
+                if let Some(w) = &mut csv {
+                    write_csv(w, r)?;
+                }
+                Ok(())
+            })?;
         }
         if let Some(mut w) = csv {
             w.flush()?;
@@ -1032,6 +1080,7 @@ fn install_cancel_handler() -> Result<()> {
 fn run_command(cli: Cli, guard: &resource::MemoryGuard) -> Result<bool> {
     match cli.command {
         Command::Build(o) => build(o, guard),
+        Command::PowerBi(o) => powerbi::run(o, guard),
         Command::Inspect(o) => {
             inspect(o)?;
             Ok(false)

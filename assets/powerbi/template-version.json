@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "schemas": "microsoft/json-schemas@582c790d5862f8330d839bffdcf81ba23e984c96",
+  "nativeReportReference": "microsoft/BCApps@4c69c7ebe06750b304a79f9159a2ce16145bf3d2, Finance app.Report",
+  "semanticModelReference": "microsoft/Analysis-Services@d3ccb5032c9029b097276b88412f7b61df6e73b8, pbidevmode/fabricps-pbip/SamplePBIP",
+  "semanticModelCompatibilityLevel": 1601
+}
